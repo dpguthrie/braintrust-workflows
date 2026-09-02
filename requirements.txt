@@ -1,0 +1,3 @@
+braintrust>=0.2
+requests>=2.31
+autoevals>=0.0.100   # only needed for 02_offline_evals.py --use-llm
