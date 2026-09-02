@@ -178,7 +178,7 @@ loop — detect, harvest, report — with nobody in the seat.
 does it well.
 
 **Put in prompts/docs, not a skill:** the BTQL gotchas from the
-[main README](../README.md#things-worth-knowing-before-reading-the-code).
+[main README](../README.md#gotchas).
 They bite the agent path exactly as hard, because `sql_query` runs the same
 engine — verified live that `scores['Answer non-empty']` works through MCP and
 the quoted form does not.
@@ -219,12 +219,6 @@ for line in sys.stdin.read().splitlines():
 If your version predates the write tools, the agent story on your cluster is
 read-only discovery, and writes go through the `bt` CLI and SDK. Still useful,
 just a different shape.
-
-**One more, if you are behind mTLS:** `bt` accepts `--api-url`, `--app-url` and
-`--ca-cert`, but has no client-certificate flag that I could find. If your data
-plane requires client certs, `bt setup mcp` may not be able to reach it. The
-Python scripts in this repo handle that case via
-`braintrust.set_http_adapter()`; the CLI has no equivalent hook.
 
 ---
 

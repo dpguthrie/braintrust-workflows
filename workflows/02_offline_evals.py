@@ -9,18 +9,13 @@
       -> decide whether to ship
 
 Run:
-    python 02_offline_evals.py                     # stub task, free
-    python 02_offline_evals.py --use-llm           # invoke the real prompt
-    python 02_offline_evals.py --baseline w02-v1-abc123
+    python workflows/02_offline_evals.py                    # stub task, free
+    python workflows/02_offline_evals.py --use-llm          # invoke the real prompt
+    python workflows/02_offline_evals.py --baseline w02-v1-abc123
 
 Exit code is the ship decision: 0 = ship, 1 = block. That is the whole
 contract a CI required-status-check needs -- the PR comment is cosmetic, the
 job exit code is the gate.
-
-What to measure when running this at scale:
-  * eval wall time vs. dataset size and --max-concurrency
-  * eval result -> queryable lag (polled below)
-  * experiment comparison latency at 1M / 10M / 100M rows
 """
 
 from __future__ import annotations
@@ -141,7 +136,6 @@ def main() -> None:
     args = ap.parse_args()
 
     c.banner("Offline evals")
-    c.install_sdk_tls()
     pid = c.project_id()
 
     # ---------------------------------------------------------- 1. dataset
@@ -195,7 +189,7 @@ def main() -> None:
 
     # ----------------------------------------------------- 3. run evaluators
     c.step("Run the evaluators")
-    exp_name = f"w02-{args.model}-{c._RUN_ID}"
+    exp_name = f"w02-{args.model}-{c.RUN_ID}"
     baseline = args.baseline or latest_baseline(pid, exclude=exp_name)
     c.info(f"experiment={exp_name}  baseline={baseline or '(none -- first run)'}")
 
@@ -218,7 +212,6 @@ def main() -> None:
         tags=["workflow-02", "offline"],
     )
     dur = time.time() - t0
-    c.metric("eval_run", dur * 1000, cases=len(data), cases_per_s=round(len(data) / max(dur, 1e-6), 2))
     summary = result.summary
     c.info(f"{len(data):,} cases in {dur:.1f}s ({len(data) / max(dur, 1e-6):.1f} cases/s)")
     c.info(summary.experiment_url or "")
@@ -286,14 +279,6 @@ def main() -> None:
         if gate.diff is not None and gate.diff < -args.max_regression:
             reasons.append(f"regressed {gate.diff:+.4f} vs baseline (max {-args.max_regression:+.4f})")
 
-    c.metric(
-        "ship_decision",
-        0,
-        ship=not reasons,
-        score=gate.score if gate else None,
-        diff=gate.diff if gate else None,
-        errors=len(errored),
-    )
     if reasons:
         print("\n\033[31mBLOCK\033[0m " + "; ".join(reasons))
         print(f"      {summary.experiment_url}")

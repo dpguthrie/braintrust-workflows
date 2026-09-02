@@ -1,33 +1,24 @@
 """Shared helpers for the Braintrust workflow scripts.
 
-Everything here is deliberately thin: one authenticated `requests.Session`
-against the Braintrust REST API, a BTQL helper, an ingest->queryable poller,
-and a metric emitter so each workflow doubles as a load-test probe.
+Deliberately thin: one authenticated `requests.Session` against the Braintrust
+REST API, a BTQL helper, and a poller for the gap between writing data and
+being able to query it.
 
 Environment
 -----------
   BRAINTRUST_API_KEY   (required)
-  BRAINTRUST_API_URL   data-plane API base. Default https://api.braintrust.dev
-                       For BYOC this is your own API endpoint.
-  BRAINTRUST_APP_URL   app base, used only to build permalinks.
-                       Default https://www.braintrust.dev
-  BRAINTRUST_ORG_NAME  required if your key belongs to >1 org
-  BT_PROJECT           project name the workflows write into.
+  BT_PROJECT           project the workflows write into.
                        Default "braintrust-workflows"
 
-  # Optional mTLS (client certs in front of a self-hosted data plane)
-  BRAINTRUST_CLIENT_CERT  path to client cert (PEM)
-  BRAINTRUST_CLIENT_KEY   path to client key (PEM)
-  BRAINTRUST_CA_BUNDLE    path to CA bundle, or "0" to disable verification
-
-  # Metric output
-  BT_METRICS_FILE      append one JSON object per timed step to this file
+  BRAINTRUST_API_URL   data-plane API base. Default https://api.braintrust.dev
+                       Set this for self-hosted / BYOC.
+  BRAINTRUST_APP_URL   app base, used only to build permalinks.
+                       Default https://www.braintrust.dev
+  BRAINTRUST_ORG_NAME  required if your key belongs to more than one org
 """
 
 from __future__ import annotations
 
-import contextlib
-import json
 import os
 import sys
 import time
@@ -43,46 +34,14 @@ APP_URL = os.environ.get("BRAINTRUST_APP_URL", "https://www.braintrust.dev").rst
 ORG_NAME = os.environ.get("BRAINTRUST_ORG_NAME")
 PROJECT_NAME = os.environ.get("BT_PROJECT", "braintrust-workflows")
 
-_CLIENT_CERT = os.environ.get("BRAINTRUST_CLIENT_CERT")
-_CLIENT_KEY = os.environ.get("BRAINTRUST_CLIENT_KEY")
-_CA_BUNDLE = os.environ.get("BRAINTRUST_CA_BUNDLE")
-
-# `query_source` shows up in Braintrust's own query logs. Tagging every request
-# from these scripts makes it trivial to isolate workflow traffic from real
-# traffic when reading the slow-query / lint dashboards during a load test.
+# `query_source` is echoed back in Braintrust's query logs, so tagging these
+# requests keeps script traffic distinguishable from your application's.
 QUERY_SOURCE = os.environ.get("BT_QUERY_SOURCE", "braintrust_workflows")
 
 
 # --------------------------------------------------------------------------
 # transport
 # --------------------------------------------------------------------------
-
-
-def _tls_kwargs() -> dict[str, Any]:
-    kw: dict[str, Any] = {}
-    if _CLIENT_CERT and _CLIENT_KEY:
-        kw["cert"] = (_CLIENT_CERT, _CLIENT_KEY)
-    elif _CLIENT_CERT:
-        kw["cert"] = _CLIENT_CERT
-    if _CA_BUNDLE == "0":
-        kw["verify"] = False
-    elif _CA_BUNDLE:
-        kw["verify"] = _CA_BUNDLE
-    return kw
-
-
-class _MTLSAdapter(requests.adapters.HTTPAdapter):
-    """Forces client certs / CA bundle onto every request.
-
-    The Braintrust SDK opens its own `requests.Session` objects, so setting
-    `session.cert` is not enough. `braintrust.set_http_adapter()` accepts an
-    adapter, and `send()` is the one place both SDK and script traffic passes
-    through. See `install_sdk_tls()`.
-    """
-
-    def send(self, request, **kwargs):  # type: ignore[override]
-        kwargs.update(_tls_kwargs())
-        return super().send(request, **kwargs)
 
 
 _session: requests.Session | None = None
@@ -93,34 +52,15 @@ def session() -> requests.Session:
     if _session is None:
         if not API_KEY:
             die("BRAINTRUST_API_KEY is not set")
-        s = requests.Session()
-        s.headers.update(
+        _session = requests.Session()
+        _session.headers.update(
             {
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json",
                 "Accept-Encoding": "gzip",
             }
         )
-        tls = _tls_kwargs()
-        if "cert" in tls:
-            s.cert = tls["cert"]
-        if "verify" in tls:
-            s.verify = tls["verify"]
-        _session = s
     return _session
-
-
-def install_sdk_tls() -> None:
-    """Route the braintrust SDK's HTTP traffic through the same TLS config.
-
-    No-op unless client certs / a custom CA are configured. Call this once,
-    before any other braintrust SDK call.
-    """
-    if not (_CLIENT_CERT or _CA_BUNDLE):
-        return
-    import braintrust
-
-    braintrust.set_http_adapter(_MTLSAdapter())
 
 
 class BTError(RuntimeError):
@@ -135,7 +75,7 @@ class BTError(RuntimeError):
 # Observed intermittently on otherwise-valid requests, both on /btql and on
 # /v1/prompt: a 400 carrying a WASM-level runtime error rather than a real
 # validation failure. The identical request succeeds on retry. Retry it a
-# bounded number of times rather than failing a long load-test run on it.
+# bounded number of times rather than failing the whole run on it.
 _TRANSIENT = "memory access out of bounds"
 RETRIES = int(os.environ.get("BT_RETRIES", "3"))
 
@@ -158,7 +98,6 @@ def _request(method: str, path: str, **kwargs: Any) -> Any:
             if e.status != 400 or _TRANSIENT not in e.body:
                 raise
             last = e
-            metric("transient_400_retry", 0, path=path, attempt=attempt + 1)
             time.sleep(0.5 * (attempt + 1))
     assert last is not None
     raise last
@@ -336,28 +275,23 @@ def wait_until_queryable(
     expect_at_least: int,
     timeout_s: float = 180.0,
     interval_s: float = 1.0,
-    label: str = "ingest_to_queryable",
+    label: str = "rows",
     **opts: Any,
 ) -> float:
-    """Poll a COUNT query until it reaches `expect_at_least`.
+    """Poll a COUNT query until it reaches `expect_at_least`. Returns seconds waited.
 
-    Returns seconds elapsed. This is the §5.1 "ingest -> queryable" metric:
-    a span is not counted as ingested until a query can see it.
+    Writes are not immediately visible to queries. Anything that writes rows
+    and then reads them back has to wait for this, so it is its own step in
+    every workflow rather than a hidden sleep.
     """
     t0 = time.time()
-    last = -1
     while True:
         got = btql_scalar(query, **opts) or 0
-        if got != last:
-            last = got
         if got >= expect_at_least:
-            elapsed = time.time() - t0
-            metric(label, elapsed * 1000, rows=got, expected=expect_at_least)
-            return elapsed
+            return time.time() - t0
         if time.time() - t0 > timeout_s:
             elapsed = time.time() - t0
-            metric(label, elapsed * 1000, rows=got, expected=expect_at_least, timed_out=True)
-            warn(f"{label}: timed out after {elapsed:.1f}s with {got}/{expect_at_least} rows queryable")
+            warn(f"timed out after {elapsed:.0f}s with {got}/{expect_at_least} {label} queryable")
             return elapsed
         time.sleep(interval_s)
 
@@ -366,31 +300,9 @@ def wait_until_queryable(
 # output
 # --------------------------------------------------------------------------
 
-_RUN_ID = os.environ.get("BT_RUN_ID") or uuid.uuid4().hex[:12]
-_METRICS_FILE = os.environ.get("BT_METRICS_FILE")
-
-
-def metric(name: str, ms: float, **fields: Any) -> None:
-    """Emit one structured timing record.
-
-    Goes to stderr always, and to BT_METRICS_FILE as JSONL if set, so a load
-    harness can collect p50/p95/p99 per workflow step without parsing prose.
-    """
-    rec = {"run_id": _RUN_ID, "ts": time.time(), "step": name, "ms": round(ms, 1), **fields}
-    line = json.dumps(rec)
-    print(f"    [metric] {line}", file=sys.stderr)
-    if _METRICS_FILE:
-        with open(_METRICS_FILE, "a") as f:
-            f.write(line + "\n")
-
-
-@contextlib.contextmanager
-def timed(name: str, **fields: Any):
-    t0 = time.time()
-    try:
-        yield
-    finally:
-        metric(name, (time.time() - t0) * 1000, **fields)
+# Distinguishes objects created by one run from another's. Reused in
+# experiment names and in metadata so a rerun never collides with the last.
+RUN_ID = os.environ.get("BTRUN_ID") or uuid.uuid4().hex[:12]
 
 
 _step_n = 0
@@ -417,7 +329,7 @@ def die(text: str) -> None:
 
 def banner(title: str) -> None:
     print(f"\n\033[1;36m{'=' * 72}\n{title}\n{'=' * 72}\033[0m")
-    info(f"api_url={API_URL}  project={PROJECT_NAME}  run_id={_RUN_ID}")
+    info(f"api_url={API_URL}  project={PROJECT_NAME}  run_id={RUN_ID}")
 
 
 # --------------------------------------------------------------------------

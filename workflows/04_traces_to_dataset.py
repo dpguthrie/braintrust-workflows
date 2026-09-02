@@ -8,16 +8,11 @@
       -> version the dataset
 
 Run:
-    python 04_traces_to_dataset.py
-    python 04_traces_to_dataset.py --select error --limit 5000
-    python 04_traces_to_dataset.py --select low-score --score-field "Answer non-empty"
+    python workflows/04_traces_to_dataset.py
+    python workflows/04_traces_to_dataset.py --select error
+    python workflows/04_traces_to_dataset.py --select low-score --score-field "Answer non-empty"
 
 Prerequisite: 03_online_evals.py has put traces in the project.
-
-What to measure when running this at scale:
-  * time to find N problematic traces in a project holding 100M / 1B spans
-  * paginated export throughput (rows/s) out of project_logs
-  * dataset write throughput back in, and the resulting ingest -> queryable lag
 """
 
 from __future__ import annotations
@@ -76,7 +71,6 @@ def main() -> None:
     args = ap.parse_args()
 
     c.banner(f"Traces to dataset (select={args.select})")
-    c.install_sdk_tls()
     pid = c.project_id()
 
     window = f"created > now() - interval {args.window_minutes} minute"
@@ -93,13 +87,12 @@ def main() -> None:
     # Poll rather than fail on the first zero. Scores written moments ago are
     # not necessarily visible to an aggregate yet, and a reference script that
     # dies on a transient empty result is just annoying.
-    with c.timed("count_problematic"):
-        deadline = time.time() + args.wait_seconds
-        while True:
-            total = c.btql_scalar(count_sql) or 0
-            if total or time.time() > deadline:
-                break
-            time.sleep(2.0)
+    deadline = time.time() + args.wait_seconds
+    while True:
+        total = c.btql_scalar(count_sql) or 0
+        if total or time.time() > deadline:
+            break
+        time.sleep(2.0)
     c.info(f"{total:,} matching root spans in the last {args.window_minutes} minutes")
     if not total:
         c.die(
@@ -111,19 +104,18 @@ def main() -> None:
     # Where the failures concentrate. This is the step that decides whether the
     # dataset is worth building: a failure mode spread evenly across every
     # dimension is usually an eval problem, not a model problem.
-    with c.timed("failure_breakdown"):
-        breakdown = c.btql(
-            f"""
-            SELECT metadata.release          AS release,
-                   metadata.surface          AS surface,
-                   count_distinct(root_span_id) AS traces
-            FROM project_logs('{pid}')
-            WHERE {window} AND is_root AND {predicate}
-            GROUP BY metadata.release, metadata.surface
-            ORDER BY traces DESC
-            LIMIT 10
-            """
-        )
+    breakdown = c.btql(
+        f"""
+        SELECT metadata.release          AS release,
+               metadata.surface          AS surface,
+               count_distinct(root_span_id) AS traces
+        FROM project_logs('{pid}')
+        WHERE {window} AND is_root AND {predicate}
+        GROUP BY metadata.release, metadata.surface
+        ORDER BY traces DESC
+        LIMIT 10
+        """
+    )
     for row in breakdown:
         c.info(f"  release={str(row.get('release')):<20} surface={str(row.get('surface')):<8} {row['traces']:>6}")
 
@@ -142,7 +134,6 @@ def main() -> None:
     t0 = time.time()
     rows = list(c.btql_all(export_sql, max_rows=args.limit))
     dur = time.time() - t0
-    c.metric("trace_export", dur * 1000, rows=len(rows), rows_per_s=round(len(rows) / max(dur, 1e-6), 1))
     c.info(f"exported {len(rows):,} traces in {dur:.1f}s")
 
     # Deduplicate on the actual input. Production repeats itself; a dataset
@@ -196,7 +187,6 @@ def main() -> None:
         )
     ds.flush()
     dur = time.time() - t0
-    c.metric("dataset_write", dur * 1000, rows=len(row_ids), rows_per_s=round(len(row_ids) / max(dur, 1e-6), 1))
     c.info(f"wrote {len(row_ids):,} rows in {dur:.1f}s")
 
     c.wait_until_queryable(
@@ -218,20 +208,19 @@ def main() -> None:
     )
     c.info(f"{len(to_review)} rows queued for review")
 
-    with c.timed("annotate", n=len(to_review)):
-        for r in to_review:
-            question = (r.get("input") or {}).get("question", "")
-            # Stand-in for a subject-matter expert. In practice this is either
-            # the Braintrust human-review UI or an SME-facing custom view; both
-            # write to the same `expected` field.
-            ground_truth = {"answer": f"[SME] correct answer for: {question[:60]}"}
-            ds.update(
-                id=r["id"],
-                expected=ground_truth,
-                tags=["from-production", "reviewed", args.select],
-                metadata={"reviewed_by": "04_traces_to_dataset", "reviewed_at": time.time()},
-            )
-        ds.flush()
+    for r in to_review:
+        question = (r.get("input") or {}).get("question", "")
+        # Stand-in for a subject-matter expert. In practice this is either
+        # the Braintrust human-review UI or an SME-facing custom view; both
+        # write to the same `expected` field.
+        ground_truth = {"answer": f"[SME] correct answer for: {question[:60]}"}
+        ds.update(
+            id=r["id"],
+            expected=ground_truth,
+            tags=["from-production", "reviewed", args.select],
+            metadata={"reviewed_by": "04_traces_to_dataset", "reviewed_at": time.time()},
+        )
+    ds.flush()
 
     # Reviewer commentary that is not ground truth goes on the audit log
     # instead of the row, so it never leaks into the eval input.

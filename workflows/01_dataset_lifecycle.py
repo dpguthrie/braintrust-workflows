@@ -9,15 +9,13 @@
       -> reuse it across experiments
 
 Run:
-    python 01_dataset_lifecycle.py --rows 1000
-    python 01_dataset_lifecycle.py --rows 250000 --batch 5000 --skip-experiments
+    python workflows/01_dataset_lifecycle.py --rows 1000
+    python workflows/01_dataset_lifecycle.py --skip-experiments
 
-What to measure when running this at scale:
-  * insert throughput (rows/s) and the flush wall time
-  * ingest -> queryable lag (the script polls for it and emits a metric)
-  * filter / full-text search latency against a cold and warm dataset
-  * whether a pinned read (`version=<xact_id>`) still reproduces the pre-edit
-    state after edits and deletes
+The point of the last two steps: a snapshot pins one `_xact_id`, and reading
+at that version reproduces the dataset exactly as it was, edits and deletes
+included. The script proves it by editing again *after* the snapshot and
+reading both.
 """
 
 from __future__ import annotations
@@ -40,7 +38,6 @@ def main() -> None:
     args = ap.parse_args()
 
     c.banner(f"Dataset lifecycle ({args.rows:,} rows)")
-    c.install_sdk_tls()
     pid = c.project_id()
 
     # ---------------------------------------------------------------- create
@@ -72,7 +69,6 @@ def main() -> None:
             c.info(f"flushed {written:,}/{args.rows:,}")
     ds.flush()
     elapsed = time.time() - t0
-    c.metric("dataset_insert", elapsed * 1000, rows=args.rows, rows_per_s=round(args.rows / max(elapsed, 1e-6), 1))
     c.info(f"wrote {args.rows:,} rows in {elapsed:.1f}s ({args.rows / max(elapsed, 1e-6):,.0f} rows/s)")
 
     # ------------------------------------------------------------- freshness
@@ -88,78 +84,72 @@ def main() -> None:
 
     # --------------------------------------------------------------- inspect
     c.step("Inspect the dataset")
-    with c.timed("dataset_summarize"):
-        summary = ds.summarize()
+    summary = ds.summarize()
     c.info(str(summary).strip().replace("\n", "\n    "))
 
-    with c.timed("dataset_profile_query"):
-        profile = c.btql(
-            f"""
-            SELECT metadata.surface     AS surface,
-                   metadata.difficulty  AS difficulty,
-                   count(1)             AS n
-            FROM dataset('{ds.id}')
-            GROUP BY metadata.surface, metadata.difficulty
-            ORDER BY n DESC
-            """
-        )
+    profile = c.btql(
+        f"""
+        SELECT metadata.surface     AS surface,
+               metadata.difficulty  AS difficulty,
+               count(1)             AS n
+        FROM dataset('{ds.id}')
+        GROUP BY metadata.surface, metadata.difficulty
+        ORDER BY n DESC
+        """
+    )
     for row in profile:
         c.info(f"surface={row['surface']:<8} difficulty={row['difficulty']:<8} n={row['n']:,}")
 
     # --------------------------------------------------------- filter/search
     c.step("Filter and full-text search")
 
-    with c.timed("dataset_filter"):
-        hard_web = c.btql(
-            f"""
-            SELECT id, input, expected, metadata
-            FROM dataset('{ds.id}')
-            WHERE metadata.difficulty = 'hard' AND metadata.surface = 'web'
-            ORDER BY _pagination_key
-            LIMIT 5
-            """
-        )
+    hard_web = c.btql(
+        f"""
+        SELECT id, input, expected, metadata
+        FROM dataset('{ds.id}')
+        WHERE metadata.difficulty = 'hard' AND metadata.surface = 'web'
+        ORDER BY _pagination_key
+        LIMIT 5
+        """
+    )
     c.info(f"structured filter -> {len(hard_web)} rows (showing up to 5)")
 
     # MATCH is an ordered-phrase full-text operator, not a substring match.
     # It prunes at the index level only when the field is inverted-indexed.
-    with c.timed("dataset_fulltext_search"):
-        matches = c.btql(
-            f"""
-            SELECT id, input
-            FROM dataset('{ds.id}')
-            WHERE input MATCH 'rotate an API key' OR expected MATCH 'rotate an API key'
-            ORDER BY _pagination_key
-            LIMIT 5
-            """
-        )
+    matches = c.btql(
+        f"""
+        SELECT id, input
+        FROM dataset('{ds.id}')
+        WHERE input MATCH 'rotate an API key' OR expected MATCH 'rotate an API key'
+        ORDER BY _pagination_key
+        LIMIT 5
+        """
+    )
     c.info(f"MATCH 'rotate an API key' -> {len(matches)} rows")
 
     # Paginating the whole set is the export path; cursor advance needs a
     # cursor-compatible sort (_pagination_key or _xact_id).
-    with c.timed("dataset_full_scan"):
-        scanned = sum(
-            1
-            for _ in c.btql_all(
-                f"SELECT id FROM dataset('{ds.id}') ORDER BY _pagination_key LIMIT 1000",
-                max_rows=args.rows,
-            )
+    scanned = sum(
+        1
+        for _ in c.btql_all(
+            f"SELECT id FROM dataset('{ds.id}') ORDER BY _pagination_key LIMIT 1000",
+            max_rows=args.rows,
         )
+    )
     c.info(f"paginated scan returned {scanned:,} rows")
 
     # ------------------------------------------------------------------ edit
     c.step("Edit examples")
     edit_targets = [r["id"] for r in hard_web[:3]] or [f"case-{i:08d}" for i in range(3)]
-    with c.timed("dataset_edit", n=len(edit_targets)):
-        for rid in edit_targets:
-            # update() merges: only the fields you pass change.
-            ds.update(
-                id=rid,
-                expected={"answer": "CORRECTED by quality-eng review"},
-                tags=["golden", "reviewed"],
-                metadata={"reviewed_by": "01_dataset_lifecycle", "reviewed_at": time.time()},
-            )
-        ds.flush()
+    for rid in edit_targets:
+        # update() merges: only the fields you pass change.
+        ds.update(
+            id=rid,
+            expected={"answer": "CORRECTED by quality-eng review"},
+            tags=["golden", "reviewed"],
+            metadata={"reviewed_by": "01_dataset_lifecycle", "reviewed_at": time.time()},
+        )
+    ds.flush()
     c.info(f"corrected {len(edit_targets)} rows: {', '.join(edit_targets)}")
 
     # ------------------------------------------------------------- versioning
@@ -167,18 +157,16 @@ def main() -> None:
 
     # Reading `ds.version` from the SDK fetches every row to compute the max
     # _xact_id. At scale, ask the query engine instead.
-    with c.timed("dataset_max_xact"):
-        xact_id = c.dataset_version(ds)
+    xact_id = c.dataset_version(ds)
     c.info(f"current _xact_id = {xact_id}")
 
     snap_name = f"reviewed-{time.strftime('%Y%m%d-%H%M%S')}"
-    with c.timed("dataset_snapshot"):
-        snap = c.snapshot_dataset(
-            ds.id,
-            snap_name,
-            xact_id,
-            description=f"{args.rows} rows, {len(edit_targets)} corrections applied",
-        )
+    snap = c.snapshot_dataset(
+        ds.id,
+        snap_name,
+        xact_id,
+        description=f"{args.rows} rows, {len(edit_targets)} corrections applied",
+    )
     c.info(f"snapshot {snap['id']} name={snap['name']} xact_id={snap['xact_id']}")
     c.info(f"snapshots on this dataset: {[s['name'] for s in c.list_snapshots(ds.id)]}")
 
@@ -219,15 +207,14 @@ def main() -> None:
         return 1.0 if output.get("answer") else 0.0
 
     for variant in ("baseline", "candidate"):
-        with c.timed("experiment_over_pinned_dataset", variant=variant):
-            result = braintrust.Eval(
-                c.PROJECT_NAME,
-                data=pinned_ds,
-                task=task,
-                scores=[answered],
-                experiment_name=f"w01-{variant}-{c._RUN_ID}",
-                metadata={"dataset_snapshot": snap_name, "dataset_xact_id": xact_id, "variant": variant},
-            )
+        result = braintrust.Eval(
+            c.PROJECT_NAME,
+            data=pinned_ds,
+            task=task,
+            scores=[answered],
+            experiment_name=f"w01-{variant}-{c.RUN_ID}",
+            metadata={"dataset_snapshot": snap_name, "dataset_xact_id": xact_id, "variant": variant},
+        )
         c.info(f"{variant}: {result.summary.experiment_url}")
 
     c.info(

@@ -8,15 +8,12 @@
       -> engineer investigates bad traces
 
 Run:
-    python 03_online_evals.py --requests 200 --sampling-rate 0.25
-    python 03_online_evals.py --requests 50000 --concurrency 32 --skip-setup
+    python workflows/03_online_evals.py --requests 200
+    python workflows/03_online_evals.py --requests 200 --sampling-rate 0.25 --skip-setup
 
-What to measure when running this at scale:
-  * ingest ack latency (the `log_batch` metric) vs. ingest -> queryable lag
-  * online-scoring lag: how long after a trace lands does `scores.*` appear,
-    and does that lag stabilise or grow under sustained load
-  * monitor/dashboard query latency at 100M and 1B rows -- the aggregate in
-    step 4 is the same shape the Monitor page runs
+Scoring happens server-side and asynchronously, so the script waits for scores
+to appear rather than assuming they are there. The aggregate in step 4 is the
+same shape a monitoring dashboard runs.
 """
 
 from __future__ import annotations
@@ -175,15 +172,6 @@ def poll_for_scores(pid: str, window: str, want: int, timeout_s: float, interval
                 c.info(f"score keys present: {keys}")
         if len(scored) >= want or time.time() - t0 > timeout_s:
             elapsed = time.time() - t0
-            c.metric(
-                "online_scoring_lag",
-                elapsed * 1000,
-                scored=len(scored),
-                sampled=len(rows),
-                expected=want,
-                score_field=field,
-                timed_out=len(scored) < want,
-            )
             return field, len(scored), elapsed
         time.sleep(interval_s)
 
@@ -208,7 +196,7 @@ def serve_one(logger, i: int, failure_rate: float) -> None:
                 "workflow": "online-evals",
                 "surface": case["metadata"]["surface"],
                 "release": "v2.3.1-degraded" if degraded else "v2.3.1",
-                "request_id": f"{c._RUN_ID}-{i}",
+                "request_id": f"{c.RUN_ID}-{i}",
             },
         )
 
@@ -254,7 +242,6 @@ def main() -> None:
     args = ap.parse_args()
 
     c.banner(f"Online evals ({args.requests:,} requests)")
-    c.install_sdk_tls()
     pid = c.project_id()
 
     # -------------------------------------------------- scorer + online rule
@@ -262,18 +249,16 @@ def main() -> None:
         c.step("Reusing the existing scorer and online scoring rule")
     else:
         c.step("Push the scorer and configure the online scoring rule")
-        with c.timed("push_scorer"):
-            scorer_id = upsert_scorer(pid)
+        scorer_id = upsert_scorer(pid)
         c.info(f"scorer function id={scorer_id} slug={SCORER_SLUG}")
 
-        with c.timed("upsert_online_rule"):
-            rule = upsert_online_rule(
-                pid,
-                scorer_id,
-                args.sampling_rate,
-                # `!=` is not supported in online-scoring filters -- use IS NOT.
-                btql_filter="metadata.workflow = 'online-evals'",
-            )
+        rule = upsert_online_rule(
+            pid,
+            scorer_id,
+            args.sampling_rate,
+            # `!=` is not supported in online-scoring filters -- use IS NOT.
+            btql_filter="metadata.workflow = 'online-evals'",
+        )
         c.info(f"rule id={rule['id']} sampling_rate={args.sampling_rate} scope=span apply_to_root_span=true")
 
     # ------------------------------------------------- 1. traffic and traces
@@ -283,17 +268,15 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         list(pool.map(lambda i: serve_one(logger, i, args.failure_rate), range(args.requests)))
     ack = time.time() - t0
-    c.metric("trace_generation", ack * 1000, requests=args.requests, rps=round(args.requests / max(ack, 1e-6), 1))
 
-    with c.timed("logger_flush"):
-        logger.flush()
+    logger.flush()
     c.info(f"{args.requests:,} requests, 3 spans each = {args.requests * 3:,} spans in {ack:.1f}s")
 
     window = f"created > now() - interval {args.window_minutes} minute"
     trace_count_sql = f"""
         SELECT count_distinct(root_span_id) AS n
         FROM project_logs('{pid}')
-        WHERE {window} AND metadata.request_id LIKE '{c._RUN_ID}-%'
+        WHERE {window} AND metadata.request_id LIKE '{c.RUN_ID}-%'
     """
     c.wait_until_queryable(
         trace_count_sql, expect_at_least=args.requests, label="log_ingest_to_queryable", timeout_s=300
@@ -322,24 +305,23 @@ def main() -> None:
 
     # ---------------------------------------- 3. dashboards / regression view
     c.step("Dashboard view: score and latency over time")
-    with c.timed("monitor_timeseries_query"):
-        series = c.btql(
-            f"""
-            SELECT hour(created)                    AS bucket,
-                   metadata.release                 AS release,
-                   count_distinct(root_span_id)     AS traces,
-                   avg({sf})        AS avg_score,
-                   -- metrics.duration only exists on the `summary` shape.
-                   -- On spans, derive it from the root span's own start/end.
-                   percentile(metrics.end - metrics.start, 0.95) AS p95_duration,
-                   sum(metrics.tokens)              AS tokens
-            FROM project_logs('{pid}')
-            WHERE {window} AND is_root AND metadata.workflow = 'online-evals'
-            GROUP BY hour(created), metadata.release
-            ORDER BY bucket DESC, release
-            LIMIT 20
-            """
-        )
+    series = c.btql(
+        f"""
+        SELECT hour(created)                    AS bucket,
+               metadata.release                 AS release,
+               count_distinct(root_span_id)     AS traces,
+               avg({sf})        AS avg_score,
+               -- metrics.duration only exists on the `summary` shape.
+               -- On spans, derive it from the root span's own start/end.
+               percentile(metrics.end - metrics.start, 0.95) AS p95_duration,
+               sum(metrics.tokens)              AS tokens
+        FROM project_logs('{pid}')
+        WHERE {window} AND is_root AND metadata.workflow = 'online-evals'
+        GROUP BY hour(created), metadata.release
+        ORDER BY bucket DESC, release
+        LIMIT 20
+        """
+    )
     for row in series:
         avg = row.get("avg_score")
         c.info(
@@ -348,20 +330,19 @@ def main() -> None:
             f"p95={row.get('p95_duration')}"
         )
 
-    with c.timed("regression_by_dimension_query"):
-        by_surface = c.btql(
-            f"""
-            SELECT metadata.surface            AS surface,
-                   count_distinct(root_span_id) AS traces,
-                   avg({sf})    AS avg_score,
-                   count_if({sf} < {args.score_threshold}) AS bad
-            FROM project_logs('{pid}')
-            WHERE {window} AND is_root AND metadata.workflow = 'online-evals'
-            GROUP BY metadata.surface
-            HAVING count(1) > 0
-            ORDER BY avg_score ASC
-            """
-        )
+    by_surface = c.btql(
+        f"""
+        SELECT metadata.surface            AS surface,
+               count_distinct(root_span_id) AS traces,
+               avg({sf})    AS avg_score,
+               count_if({sf} < {args.score_threshold}) AS bad
+        FROM project_logs('{pid}')
+        WHERE {window} AND is_root AND metadata.workflow = 'online-evals'
+        GROUP BY metadata.surface
+        HAVING count(1) > 0
+        ORDER BY avg_score ASC
+        """
+    )
     for row in by_surface:
         avg = row.get("avg_score")
         c.info(f"  surface={str(row.get('surface')):<8} traces={row.get('traces'):>6} "
@@ -369,19 +350,18 @@ def main() -> None:
 
     # ------------------------------------------- 4. investigate bad traces
     c.step("Investigate the worst traces")
-    with c.timed("bad_trace_query"):
-        bad = c.btql(
-            f"""
-            SELECT id, root_span_id, input, output, scores, metadata
-            FROM project_logs('{pid}')
-            WHERE {window}
-              AND is_root
-              AND metadata.workflow = 'online-evals'
-              AND {sf} < {args.score_threshold}
-            ORDER BY created DESC
-            LIMIT 10
-            """
-        )
+    bad = c.btql(
+        f"""
+        SELECT id, root_span_id, input, output, scores, metadata
+        FROM project_logs('{pid}')
+        WHERE {window}
+          AND is_root
+          AND metadata.workflow = 'online-evals'
+          AND {sf} < {args.score_threshold}
+        ORDER BY created DESC
+        LIMIT 10
+        """
+    )
     c.info(f"{len(bad)} traces below {args.score_threshold}")
     for row in bad[:5]:
         question = (row.get("input") or {}).get("question", "")
@@ -392,14 +372,13 @@ def main() -> None:
         # Pull the full trace for one of them -- the retrieve + generate spans
         # are where the actual cause lives.
         rsid = bad[0]["root_span_id"]
-        with c.timed("full_trace_fetch"):
-            spans = c.btql(
-                f"""
-                SELECT span_id, span_attributes, input, output, metrics, error
-                FROM project_logs('{pid}', shape => 'traces')
-                WHERE root_span_id = '{rsid}'
-                """
-            )
+        spans = c.btql(
+            f"""
+            SELECT span_id, span_attributes, input, output, metrics, error
+            FROM project_logs('{pid}', shape => 'traces')
+            WHERE root_span_id = '{rsid}'
+            """
+        )
         c.info(f"trace {rsid} has {len(spans)} spans:")
         for s in spans:
             name = (s.get("span_attributes") or {}).get("name")
