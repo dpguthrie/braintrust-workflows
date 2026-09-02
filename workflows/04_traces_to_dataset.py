@@ -13,6 +13,9 @@ Run:
     python workflows/04_traces_to_dataset.py --select low-score --score-field "Answer non-empty"
 
 Prerequisite: 03_online_evals.py has put traces in the project.
+
+Each step below is a standalone function. `main()` at the bottom composes them
+into the full workflow; lift any one of them on its own.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from typing import Any
 
 import braintrust
 
@@ -57,6 +61,275 @@ def selection_predicate(mode: str, score_field: str, threshold: float) -> str:
     raise ValueError(mode)
 
 
+# --------------------------------------------------------------------------
+# 1. find
+# --------------------------------------------------------------------------
+
+
+def count_matching(project_id: str, window: str, predicate: str, wait_s: float = 30.0) -> int:
+    """Count root spans matching the predicate, polling briefly before giving up.
+
+    Polls rather than failing on the first zero: scores written moments ago are
+    not necessarily visible to an aggregate yet.
+    """
+    sql = f"""
+        SELECT count_distinct(root_span_id) AS n
+        FROM project_logs('{project_id}')
+        WHERE {window} AND is_root AND {predicate}
+    """
+    deadline = time.time() + wait_s
+    while True:
+        total = c.btql_scalar(sql) or 0
+        if total or time.time() > deadline:
+            return total
+        time.sleep(2.0)
+
+
+def failure_breakdown(project_id: str, window: str, predicate: str) -> list[dict[str, Any]]:
+    """Where the failures concentrate, by release and surface.
+
+    This is the step that decides whether the dataset is worth building at all:
+    a failure mode spread evenly across every dimension is usually an eval
+    problem, not a model problem.
+    """
+    return c.btql(
+        f"""
+        SELECT metadata.release             AS release,
+               metadata.surface             AS surface,
+               count_distinct(root_span_id) AS traces
+        FROM project_logs('{project_id}')
+        WHERE {window} AND is_root AND {predicate}
+        GROUP BY metadata.release, metadata.surface
+        ORDER BY traces DESC
+        LIMIT 10
+        """
+    )
+
+
+def find_problem_traces(project_id: str, window: str, predicate: str, wait_s: float, window_minutes: int) -> int:
+    """Count matches and print where they concentrate. Returns the count."""
+    c.step("Find problematic production traces")
+    total = count_matching(project_id, window, predicate, wait_s)
+    c.info(f"{total:,} matching root spans in the last {window_minutes} minutes")
+    if not total:
+        c.die(
+            f"nothing matched after {wait_s:.0f}s. Run 03_online_evals.py first, "
+            f"widen --window-minutes, or check --score-field matches the key your "
+            f"online scoring rule writes."
+        )
+    for row in failure_breakdown(project_id, window, predicate):
+        c.info(f"  release={str(row.get('release')):<20} surface={str(row.get('surface')):<8} {row['traces']:>6}")
+    return total
+
+
+# --------------------------------------------------------------------------
+# 2. select
+# --------------------------------------------------------------------------
+
+
+def export_traces(
+    project_id: str, window: str, predicate: str, limit: int, page_size: int = 500
+) -> list[dict[str, Any]]:
+    """Page out the matching root spans.
+
+    `is_root` keeps this to one row per trace. `ORDER BY _pagination_key` is
+    what makes the cursor advance -- without a cursor-compatible sort the
+    export silently re-reads page one.
+    """
+    return list(
+        c.btql_all(
+            f"""
+            SELECT id, root_span_id, created, input, output, expected, scores, metadata, tags, error
+            FROM project_logs('{project_id}')
+            WHERE {window} AND is_root AND {predicate}
+            ORDER BY _pagination_key
+            LIMIT {page_size}
+            """,
+            max_rows=limit,
+        )
+    )
+
+
+def dedupe_by_input(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one row per distinct input.
+
+    Production repeats itself. A dataset with 400 copies of the same question
+    measures nothing 400 times, and skews every aggregate you compute over it.
+    """
+    seen: set[str] = set()
+    unique = []
+    for row in rows:
+        key = json.dumps(row.get("input"), sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
+
+
+def select_examples(project_id: str, window: str, predicate: str, limit: int, page_size: int):
+    """Export and dedupe. Returns the rows worth turning into cases."""
+    c.step("Select and export the examples")
+    t0 = time.time()
+    rows = export_traces(project_id, window, predicate, limit, page_size)
+    c.info(f"exported {len(rows):,} traces in {time.time() - t0:.1f}s")
+    unique = dedupe_by_input(rows)
+    c.info(f"{len(unique):,} unique inputs after dedupe ({len(rows) - len(unique):,} duplicates dropped)")
+    return unique
+
+
+# --------------------------------------------------------------------------
+# 3. build
+# --------------------------------------------------------------------------
+
+
+def build_dataset(
+    project_id: str, name: str, predicate: str, rows: list[dict[str, Any]], select_mode: str
+) -> tuple[braintrust.Dataset, list[str]]:
+    """Write the harvested traces into a dataset. Returns (dataset, row_ids).
+
+    Two choices worth copying:
+
+    - the source span id becomes the dataset row id, so re-harvesting is
+      idempotent and every row keeps a back-pointer to the trace it came from
+    - `expected` stays empty. What production produced is the observed output,
+      not ground truth -- that is what the annotate step is for. Putting the
+      observed output in `expected` bakes the bug into the dataset.
+    """
+    c.step("Convert them into an eval dataset")
+    dataset = braintrust.init_dataset(
+        project=c.PROJECT_NAME,
+        name=name,
+        description=f"Harvested from production traces where {predicate}",
+        metadata={"source": "04_traces_to_dataset", "predicate": predicate, "harvested_at": time.time()},
+    )
+    c.info(f"dataset_id={dataset.id}")
+
+    t0 = time.time()
+    row_ids = []
+    for row in rows:
+        row_id = row["id"]
+        row_ids.append(row_id)
+        dataset.insert(
+            id=row_id,
+            input=row.get("input"),
+            expected=None,
+            tags=["from-production", "needs-review", select_mode],
+            metadata={
+                "source_root_span_id": row.get("root_span_id"),
+                "source_span_id": row_id,
+                "source_permalink": c.log_permalink(project_id, row_id),
+                "observed_output": row.get("output"),
+                "observed_scores": row.get("scores"),
+                "observed_error": row.get("error"),
+                "release": (row.get("metadata") or {}).get("release"),
+                "surface": (row.get("metadata") or {}).get("surface"),
+            },
+        )
+    dataset.flush()
+    c.info(f"wrote {len(row_ids):,} rows in {time.time() - t0:.1f}s")
+
+    c.wait_until_queryable(
+        f"SELECT count(1) AS n FROM dataset('{dataset.id}')", expect_at_least=len(row_ids)
+    )
+    return dataset, row_ids
+
+
+# --------------------------------------------------------------------------
+# 4. annotate
+# --------------------------------------------------------------------------
+
+
+def rows_needing_review(dataset_id: str, limit: int) -> list[dict[str, Any]]:
+    """Rows still tagged `needs-review`. `INCLUDES` is BTQL-only; SQL uses IN."""
+    return c.btql(
+        f"""
+        SELECT id, input, metadata
+        FROM dataset('{dataset_id}')
+        WHERE tags IN ('needs-review')
+        ORDER BY _pagination_key
+        LIMIT {limit}
+        """
+    )
+
+
+def add_review_comment(dataset_id: str, row_id: str, comment: str) -> None:
+    """Attach reviewer commentary to a row's audit log, not to the row.
+
+    Notes that are not ground truth belong here, where they never leak into
+    the eval input.
+    """
+    c.api_post(
+        f"/v1/dataset/{dataset_id}/feedback",
+        {"feedback": [{"id": row_id, "comment": comment, "source": "api"}]},
+    )
+
+
+def annotate(dataset: braintrust.Dataset, limit: int, select_mode: str) -> list[dict[str, Any]]:
+    """Fill in `expected` for rows awaiting review.
+
+    The ground truth here is a stand-in for a subject-matter expert. In practice
+    that is the Braintrust human-review UI or an SME-facing custom view; both
+    write to the same `expected` field.
+    """
+    c.step("Annotate the expected behavior")
+    to_review = rows_needing_review(dataset.id, limit)
+    c.info(f"{len(to_review)} rows queued for review")
+
+    for row in to_review:
+        question = (row.get("input") or {}).get("question", "")
+        dataset.update(
+            id=row["id"],
+            expected={"answer": f"[SME] correct answer for: {question[:60]}"},
+            tags=["from-production", "reviewed", select_mode],
+            metadata={"reviewed_by": "04_traces_to_dataset", "reviewed_at": time.time()},
+        )
+    dataset.flush()
+
+    if to_review:
+        add_review_comment(
+            dataset.id,
+            to_review[0]["id"],
+            "Retrieval returned the wrong KB article; expected answer added by review.",
+        )
+        c.info("attached a review comment to the first row")
+    return to_review
+
+
+# --------------------------------------------------------------------------
+# 5. version
+# --------------------------------------------------------------------------
+
+
+def version_dataset(
+    dataset: braintrust.Dataset, label: str, reviewed: int, total: int, predicate: str
+) -> str:
+    """Snapshot the annotated dataset. Returns the pinned xact_id."""
+    c.step("Version the dataset")
+    c.wait_until_queryable(
+        f"SELECT count(1) AS n FROM dataset('{dataset.id}') WHERE tags IN ('reviewed')",
+        expect_at_least=reviewed,
+    )
+    xact_id = c.dataset_version(dataset)
+    snapshot = c.snapshot_dataset(
+        dataset.id,
+        label,
+        xact_id,
+        description=f"{total} harvested, {reviewed} reviewed. Predicate: {predicate}",
+    )
+    c.info(f"snapshot {snapshot['id']} name={snapshot['name']} xact_id={snapshot['xact_id']}")
+
+    pinned = c.btql_scalar(
+        f"SELECT count(1) AS n FROM dataset('{dataset.id}') WHERE tags IN ('reviewed')", version=xact_id
+    )
+    c.info(f"pinned read at {xact_id}: {pinned} reviewed rows of {total} total")
+    return xact_id
+
+
+# --------------------------------------------------------------------------
+# the workflow
+# --------------------------------------------------------------------------
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--select", default="low-score", choices=["low-score", "error", "slow", "tagged"])
@@ -72,194 +345,23 @@ def main() -> None:
 
     c.banner(f"Traces to dataset (select={args.select})")
     pid = c.project_id()
-
     window = f"created > now() - interval {args.window_minutes} minute"
     predicate = selection_predicate(args.select, args.score_field, args.threshold)
     c.info(f"predicate: {predicate}")
 
-    # ------------------------------------------------------- 1. find traces
-    c.step("Find problematic production traces")
-    count_sql = f"""
-        SELECT count_distinct(root_span_id) AS n
-        FROM project_logs('{pid}')
-        WHERE {window} AND is_root AND {predicate}
-    """
-    # Poll rather than fail on the first zero. Scores written moments ago are
-    # not necessarily visible to an aggregate yet, and a reference script that
-    # dies on a transient empty result is just annoying.
-    deadline = time.time() + args.wait_seconds
-    while True:
-        total = c.btql_scalar(count_sql) or 0
-        if total or time.time() > deadline:
-            break
-        time.sleep(2.0)
-    c.info(f"{total:,} matching root spans in the last {args.window_minutes} minutes")
-    if not total:
-        c.die(
-            f"nothing matched after {args.wait_seconds:.0f}s. Run 03_online_evals.py "
-            f"first, widen --window-minutes, or check --score-field matches the key "
-            f"your online scoring rule writes."
-        )
+    find_problem_traces(pid, window, predicate, args.wait_seconds, args.window_minutes)
+    rows = select_examples(pid, window, predicate, args.limit, args.page_size)
 
-    # Where the failures concentrate. This is the step that decides whether the
-    # dataset is worth building: a failure mode spread evenly across every
-    # dimension is usually an eval problem, not a model problem.
-    breakdown = c.btql(
-        f"""
-        SELECT metadata.release          AS release,
-               metadata.surface          AS surface,
-               count_distinct(root_span_id) AS traces
-        FROM project_logs('{pid}')
-        WHERE {window} AND is_root AND {predicate}
-        GROUP BY metadata.release, metadata.surface
-        ORDER BY traces DESC
-        LIMIT 10
-        """
+    dataset, row_ids = build_dataset(pid, args.dataset, predicate, rows, args.select)
+    reviewed = annotate(dataset, args.annotate, args.select)
+
+    xact_id = version_dataset(
+        dataset,
+        label=f"{args.select}-{time.strftime('%Y%m%d-%H%M%S')}",
+        reviewed=len(reviewed),
+        total=len(row_ids),
+        predicate=predicate,
     )
-    for row in breakdown:
-        c.info(f"  release={str(row.get('release')):<20} surface={str(row.get('surface')):<8} {row['traces']:>6}")
-
-    # --------------------------------------------------- 2. select examples
-    c.step("Select and export the examples")
-    # `is_root` keeps this to one row per trace. `ORDER BY _pagination_key`
-    # is what makes the cursor advance -- without a cursor-compatible sort the
-    # export silently re-reads page one.
-    export_sql = f"""
-        SELECT id, root_span_id, created, input, output, expected, scores, metadata, tags, error
-        FROM project_logs('{pid}')
-        WHERE {window} AND is_root AND {predicate}
-        ORDER BY _pagination_key
-        LIMIT {args.page_size}
-    """
-    t0 = time.time()
-    rows = list(c.btql_all(export_sql, max_rows=args.limit))
-    dur = time.time() - t0
-    c.info(f"exported {len(rows):,} traces in {dur:.1f}s")
-
-    # Deduplicate on the actual input. Production repeats itself; a dataset
-    # with 400 copies of the same question measures nothing 400 times.
-    seen: set[str] = set()
-    unique = []
-    for r in rows:
-        key = json.dumps(r.get("input"), sort_keys=True, default=str)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(r)
-    c.info(f"{len(unique):,} unique inputs after dedupe ({len(rows) - len(unique):,} duplicates dropped)")
-
-    # ------------------------------------------------- 3. build the dataset
-    c.step("Convert them into an eval dataset")
-    ds = braintrust.init_dataset(
-        project=c.PROJECT_NAME,
-        name=args.dataset,
-        description=f"Harvested from production traces where {predicate}",
-        metadata={"source": "04_traces_to_dataset", "predicate": predicate, "harvested_at": time.time()},
-    )
-    c.info(f"dataset_id={ds.id}")
-
-    t0 = time.time()
-    row_ids: list[str] = []
-    for r in unique:
-        # Reusing the source span id as the dataset row id makes the harvest
-        # idempotent: re-running never duplicates a case, and it keeps a
-        # back-pointer from every dataset row to the trace it came from.
-        rid = r["id"]
-        row_ids.append(rid)
-        ds.insert(
-            id=rid,
-            input=r.get("input"),
-            # `expected` stays empty on purpose. What production produced is
-            # the observed output, not the ground truth; step 4 is where a
-            # human supplies the truth.
-            expected=None,
-            tags=["from-production", "needs-review", args.select],
-            metadata={
-                "source_root_span_id": r.get("root_span_id"),
-                "source_span_id": rid,
-                "source_permalink": c.log_permalink(pid, rid),
-                "observed_output": r.get("output"),
-                "observed_scores": r.get("scores"),
-                "observed_error": r.get("error"),
-                "release": (r.get("metadata") or {}).get("release"),
-                "surface": (r.get("metadata") or {}).get("surface"),
-            },
-        )
-    ds.flush()
-    dur = time.time() - t0
-    c.info(f"wrote {len(row_ids):,} rows in {dur:.1f}s")
-
-    c.wait_until_queryable(
-        f"SELECT count(1) AS n FROM dataset('{ds.id}')",
-        expect_at_least=len(row_ids),
-        label="harvest_ingest_to_queryable",
-    )
-
-    # --------------------------------------------------------- 4. annotate
-    c.step("Annotate the expected behavior")
-    to_review = c.btql(
-        f"""
-        SELECT id, input, metadata
-        FROM dataset('{ds.id}')
-        WHERE tags IN ('needs-review')
-        ORDER BY _pagination_key
-        LIMIT {args.annotate}
-        """
-    )
-    c.info(f"{len(to_review)} rows queued for review")
-
-    for r in to_review:
-        question = (r.get("input") or {}).get("question", "")
-        # Stand-in for a subject-matter expert. In practice this is either
-        # the Braintrust human-review UI or an SME-facing custom view; both
-        # write to the same `expected` field.
-        ground_truth = {"answer": f"[SME] correct answer for: {question[:60]}"}
-        ds.update(
-            id=r["id"],
-            expected=ground_truth,
-            tags=["from-production", "reviewed", args.select],
-            metadata={"reviewed_by": "04_traces_to_dataset", "reviewed_at": time.time()},
-        )
-    ds.flush()
-
-    # Reviewer commentary that is not ground truth goes on the audit log
-    # instead of the row, so it never leaks into the eval input.
-    if to_review:
-        c.api_post(
-            f"/v1/dataset/{ds.id}/feedback",
-            {
-                "feedback": [
-                    {
-                        "id": to_review[0]["id"],
-                        "comment": "Retrieval returned the wrong KB article; expected answer added by review.",
-                        "source": "api",
-                    }
-                ]
-            },
-        )
-        c.info("attached a review comment to the first row")
-
-    # ---------------------------------------------------------- 5. version
-    c.step("Version the dataset")
-    c.wait_until_queryable(
-        f"SELECT count(1) AS n FROM dataset('{ds.id}') WHERE tags IN ('reviewed')",
-        expect_at_least=len(to_review),
-        label="annotation_to_queryable",
-    )
-    xact_id = c.dataset_version(ds)
-    snap_name = f"{args.select}-{time.strftime('%Y%m%d-%H%M%S')}"
-    snap = c.snapshot_dataset(
-        ds.id,
-        snap_name,
-        xact_id,
-        description=f"{len(row_ids)} harvested, {len(to_review)} reviewed. Predicate: {predicate}",
-    )
-    c.info(f"snapshot {snap['id']} name={snap['name']} xact_id={snap['xact_id']}")
-
-    reviewed = c.btql_scalar(
-        f"SELECT count(1) AS n FROM dataset('{ds.id}') WHERE tags IN ('reviewed')", version=xact_id
-    )
-    c.info(f"pinned read at {xact_id}: {reviewed} reviewed rows of {len(row_ids)} total")
 
     print(
         f"\nRun the regression against this exact set:\n"

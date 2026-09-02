@@ -59,6 +59,30 @@ Every script has `--help`. The data is a small synthetic support-QA corpus in
 `workflows/_common.py`; swap `_TOPICS` and `synthetic_case()` for your own
 domain when you adapt these.
 
+## How the scripts are laid out
+
+Each step of a workflow is a standalone function with a docstring explaining
+the call it makes and why. `main()` at the bottom of each file composes them,
+so the file reads as a set of parts plus one assembly:
+
+```python
+def main() -> None:
+    ...
+    dataset = import_dataset(args.dataset, args.rows, args.batch)
+    wait_for_import(dataset.id, args.rows)
+
+    profile(dataset)
+    hits = search_demo(dataset, args.rows)
+
+    correct_examples(dataset, targets)
+    snapshot, xact_id = snapshot_version(dataset, label=..., description=...)
+    compare_versions(dataset, targets[0], xact_id)
+```
+
+Lift any one function into your own code — they take plain arguments and
+return plain values. The `c.step()` / `c.info()` calls are narration for the
+demo; delete them when you copy a function out.
+
 **The LLM is optional everywhere.** Every workflow defaults to a deterministic
 stub task, so it runs for free and reproducibly. `--use-llm` on
 `02_offline_evals.py` swaps in `braintrust.invoke()` against the saved prompt,

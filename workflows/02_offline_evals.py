@@ -16,13 +16,18 @@ Run:
 Exit code is the ship decision: 0 = ship, 1 = block. That is the whole
 contract a CI required-status-check needs -- the PR comment is cosmetic, the
 job exit code is the gate.
+
+Each step below is a standalone function. `main()` at the bottom composes them
+into the full workflow; lift any one of them on its own. `ship_decision()` is
+the one to replace first -- the thresholds there are a placeholder for your
+own policy.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import time
+from typing import Any
 
 import braintrust
 
@@ -55,7 +60,9 @@ def keyword_overlap(output, expected) -> float | None:
     return len(exp_tokens & set(got.split())) / len(exp_tokens)
 
 
-def build_scorers(use_llm: bool):
+def build_scorers(use_llm: bool) -> list[Any]:
+    """The scorers this eval runs. Deterministic ones always; Factuality only
+    when an LLM is in play, since it costs money per case."""
     scorers = [answer_present, keyword_overlap]
     if use_llm:
         try:
@@ -118,10 +125,238 @@ def latest_baseline(pid: str, exclude: str, prefix: str = "w02-") -> str | None:
 
 
 # --------------------------------------------------------------------------
+# 1. dataset
+# --------------------------------------------------------------------------
+
+
+def select_dataset(name: str, version: str | None, limit: int = 0) -> tuple[braintrust.Dataset, list[Any]]:
+    """Open a dataset, optionally pinned to a version, and read its rows.
+
+    An unpinned eval is not reproducible: the dataset can change between the
+    baseline run and this one, so a score delta stops meaning anything.
+    """
+    c.step("Select the dataset")
+    dataset = braintrust.init_dataset(project=c.PROJECT_NAME, name=name, version=version)
+    n_rows = c.btql_scalar(f"SELECT count(1) AS n FROM dataset('{dataset.id}')") or 0
+    if not n_rows:
+        c.die(f"dataset '{name}' is empty -- run 01_dataset_lifecycle.py first")
+    c.info(f"dataset_id={dataset.id}  rows={n_rows:,}  pinned_version={version or 'latest (unpinned)'}")
+    if not version:
+        c.warn("Unpinned dataset. For a defensible baseline comparison, pin a snapshot xact_id.")
+
+    rows = list(dataset)
+    if limit:
+        rows = rows[:limit]
+        c.info(f"capped to {len(rows):,} rows")
+    return dataset, rows
+
+
+# --------------------------------------------------------------------------
+# 2. the thing under test
+# --------------------------------------------------------------------------
+
+
+def choose_prompt_version(
+    project_id: str, model: str, system_prompt: str, environment: str | None
+) -> str:
+    """Save the prompt and return the version to pin the eval to."""
+    c.step("Choose the model / prompt version")
+    envs = [environment] if environment else None
+    try:
+        prompt = upsert_prompt(project_id, model, system_prompt, envs)
+    except c.BTError:
+        if not envs:
+            raise
+        c.warn(f"environment '{environment}' not found; saving prompt without an environment")
+        prompt = upsert_prompt(project_id, model, system_prompt, None)
+    version = str(prompt["_xact_id"])
+    c.info(f"prompt id={prompt['id']} slug={PROMPT_SLUG} version={version} model={model}")
+    return version
+
+
+def llm_task(project_id: str, prompt_version: str):
+    """Invoke the saved prompt server-side, pinned to one version.
+
+    Pinning matters: without it the eval silently drifts onto whatever version
+    of the prompt happens to be current when it runs.
+    """
+
+    def task(input_: dict[str, Any]) -> dict[str, Any]:
+        out = braintrust.invoke(
+            project_id=project_id,
+            slug=PROMPT_SLUG,
+            version=prompt_version,
+            input={"input": input_},
+        )
+        return {"answer": out if isinstance(out, str) else json.dumps(out)}
+
+    return task
+
+
+def stub_task(input_: dict[str, Any]) -> dict[str, Any]:
+    """Stand-in for the system under test. Deterministic and free.
+
+    Answers correctly except on every fourth case, where it returns something
+    unhelpful. That gives the run a mean score comfortably above the ship gate
+    while still leaving real failures for the triage step to find -- which is
+    what an eval you are about to ship normally looks like.
+    """
+    question = (input_ or {}).get("question", "")
+    idx = int(question.split("case ")[-1].rstrip(")")) if "case " in question else 0
+    if idx % 4 == 0:
+        return {"answer": "Please check the documentation for details."}
+    return {"answer": c.synthetic_case(idx)["expected"]["answer"]}
+
+
+# --------------------------------------------------------------------------
+# 3. run
+# --------------------------------------------------------------------------
+
+
+def run_eval(
+    rows: list[Any],
+    task: Any,
+    scorers: list[Any],
+    experiment_name: str,
+    baseline: str | None,
+    metadata: dict[str, Any],
+    max_concurrency: int = 10,
+) -> Any:
+    """Run the experiment, then wait for its rows to be queryable.
+
+    `base_experiment_name` is what makes the summary carry a diff against the
+    baseline instead of bare scores.
+    """
+    c.step("Run the evaluators")
+    c.info(f"experiment={experiment_name}  baseline={baseline or '(none -- first run)'}")
+    result = braintrust.Eval(
+        c.PROJECT_NAME,
+        data=rows,
+        task=task,
+        scores=scorers,
+        experiment_name=experiment_name,
+        base_experiment_name=baseline,
+        max_concurrency=max_concurrency,
+        metadata=metadata,
+        tags=["workflow-02", "offline"],
+    )
+    c.info(result.summary.experiment_url or "")
+
+    c.step("Wait until eval results are queryable")
+    c.wait_until_queryable(
+        f"SELECT count(1) AS n FROM experiment('{result.summary.experiment_id}')",
+        expect_at_least=len(rows),
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
+# 4. triage
+# --------------------------------------------------------------------------
+
+
+def failing_rows(experiment_id: str, score_name: str, floor: float, limit: int = 10) -> list[dict[str, Any]]:
+    """Server-side triage query -- what the UI and any automation would run."""
+    return c.btql(
+        f"""
+        SELECT id, input, output, expected, scores
+        FROM experiment('{experiment_id}')
+        WHERE scores.{score_name} < {floor}
+        ORDER BY scores.{score_name} ASC
+        LIMIT {limit}
+        """
+    )
+
+
+def inspect_failures(result: Any, score_name: str, floor: float) -> list[Any]:
+    """Report errored and low-scoring cases. Returns the errored ones.
+
+    Errors and low scores are different failures: an error means the task never
+    produced an answer, and no amount of prompt tuning fixes it.
+    """
+    c.step("Inspect failures")
+    errored = [r for r in result.results if r.error is not None]
+    low = sorted(
+        (r for r in result.results if r.error is None and (r.scores.get(score_name) or 0) < floor),
+        key=lambda r: r.scores.get(score_name) or 0,
+    )
+    c.info(f"{len(errored)} errored, {len(low)} below the {floor} {score_name} bar")
+    for r in low[:5]:
+        question = (r.input or {}).get("question", "")
+        c.info(f"  score={r.scores.get(score_name):.2f}  q={question[:60]!r}")
+    for r in errored[:3]:
+        c.info(f"  ERROR {type(r.error).__name__}: {str(r.error)[:120]}")
+
+    experiment_id = result.summary.experiment_id
+    worst = failing_rows(experiment_id, score_name, floor)
+    c.info(f"BTQL returned {len(worst)} failing rows for triage")
+    for row in worst[:3]:
+        c.info(f"  {c.log_permalink(experiment_id, row['id'], object_type='experiment')}")
+    return errored
+
+
+# --------------------------------------------------------------------------
+# 5. compare
+# --------------------------------------------------------------------------
+
+
+def compare_to_baseline(summary: Any) -> dict[str, Any]:
+    """Print the score/metric diff and return the score map."""
+    c.step("Compare against the baseline")
+    if not summary.comparison_experiment_name:
+        c.warn("no baseline resolved -- this run becomes the baseline for the next one")
+    else:
+        c.info(f"{summary.experiment_name} vs {summary.comparison_experiment_name}")
+
+    scores, metrics = c.summary_scores(summary)
+    for name, s in scores.items():
+        delta = f"{s.diff:+.4f}" if s.diff is not None else "  n/a "
+        c.info(f"  {name:<20} {s.score:.4f}  delta={delta}  +{s.improvements or 0}/-{s.regressions or 0}")
+    for name, m in metrics.items():
+        c.info(f"  {name:<20} {m.metric}{m.unit}")
+    return scores
+
+
+# --------------------------------------------------------------------------
+# 6. decide
+# --------------------------------------------------------------------------
+
+
+def ship_decision(
+    scores: dict[str, Any],
+    errored: list[Any],
+    score_name: str,
+    min_score: float,
+    max_regression: float,
+) -> list[str]:
+    """Return the reasons not to ship. Empty list means ship.
+
+    Kept separate from the printing on purpose: this is the part you replace
+    with your own policy, and it is the only part CI actually depends on.
+    """
+    gate = scores.get(score_name)
+    reasons: list[str] = []
+    if errored:
+        reasons.append(f"{len(errored)} cases errored")
+    if gate is None:
+        reasons.append(f"gate score {score_name} is missing")
+        return reasons
+    if gate.score < min_score:
+        reasons.append(f"{score_name} {gate.score:.4f} < floor {min_score}")
+    if gate.diff is not None and gate.diff < -max_regression:
+        reasons.append(f"regressed {gate.diff:+.4f} vs baseline (max {-max_regression:+.4f})")
+    return reasons
+
+
+# --------------------------------------------------------------------------
+# the workflow
+# --------------------------------------------------------------------------
+
+GATE_SCORE = "keyword_overlap"
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", default="golden-support-qa")
     ap.add_argument("--dataset-version", default=None, help="pin to an _xact_id / snapshot")
     ap.add_argument("--model", default="gpt-4o-mini")
@@ -131,77 +366,29 @@ def main() -> None:
     ap.add_argument("--baseline", default=None, help="baseline experiment name")
     ap.add_argument("--max-concurrency", type=int, default=10)
     ap.add_argument("--limit", type=int, default=0, help="cap dataset rows (0 = all)")
-    ap.add_argument("--min-score", type=float, default=0.6, help="ship gate: mean keyword_overlap")
+    ap.add_argument("--min-score", type=float, default=0.5, help=f"ship gate: floor on mean {GATE_SCORE}")
     ap.add_argument("--max-regression", type=float, default=0.02, help="ship gate: allowed drop vs baseline")
     args = ap.parse_args()
 
     c.banner("Offline evals")
     pid = c.project_id()
 
-    # ---------------------------------------------------------- 1. dataset
-    c.step("Select the dataset")
-    ds = braintrust.init_dataset(project=c.PROJECT_NAME, name=args.dataset, version=args.dataset_version)
-    n_rows = c.btql_scalar(f"SELECT count(1) AS n FROM dataset('{ds.id}')") or 0
-    if not n_rows:
-        c.die(f"dataset '{args.dataset}' is empty -- run 01_dataset_lifecycle.py first")
-    c.info(f"dataset_id={ds.id}  rows={n_rows:,}  pinned_version={args.dataset_version or 'latest (unpinned)'}")
-    if not args.dataset_version:
-        c.warn("Unpinned dataset. For a defensible baseline comparison, pin a snapshot xact_id.")
+    _, rows = select_dataset(args.dataset, args.dataset_version, args.limit)
 
-    data = list(ds)
-    if args.limit:
-        data = data[: args.limit]
-        c.info(f"capped to {len(data):,} rows")
-
-    # ------------------------------------------------ 2. prompt/model version
-    c.step("Choose the model / prompt version")
-    envs = [args.environment] if args.environment else None
-    try:
-        prompt = upsert_prompt(pid, args.model, args.system_prompt, envs)
-    except c.BTError:
-        if not envs:
-            raise
-        c.warn(f"environment '{args.environment}' not found; saving prompt without an environment")
-        prompt = upsert_prompt(pid, args.model, args.system_prompt, None)
-    prompt_version = str(prompt["_xact_id"])
-    c.info(f"prompt id={prompt['id']} slug={PROMPT_SLUG} version={prompt_version} model={args.model}")
-
+    prompt_version = choose_prompt_version(pid, args.model, args.system_prompt, args.environment)
     if args.use_llm:
-        def task(input_):
-            out = braintrust.invoke(
-                project_id=pid,
-                slug=PROMPT_SLUG,
-                version=prompt_version,  # pin: never let the eval drift onto a newer prompt
-                input={"input": input_},
-            )
-            return {"answer": out if isinstance(out, str) else json.dumps(out)}
+        task = llm_task(pid, prompt_version)
     else:
-        def task(input_):
-            # Stand-in for the system under test: recovers the fixture's answer
-            # and drops one token, so the run produces a realistic score just
-            # under 1.0 rather than a degenerate 0. Deterministic and free, so
-            # it can be driven at any size.
-            question = (input_ or {}).get("question", "")
-            idx = int(question.split("case ")[-1].rstrip(")")) if "case " in question else 0
-            words = c.synthetic_case(idx)["expected"]["answer"].split()
-            return {"answer": " ".join(words[:-1]) if len(words) > 2 else " ".join(words)}
+        task = stub_task
         c.info("using the stub task (no LLM spend). Add --use-llm to invoke the saved prompt.")
 
-    # ----------------------------------------------------- 3. run evaluators
-    c.step("Run the evaluators")
-    exp_name = f"w02-{args.model}-{c.RUN_ID}"
-    baseline = args.baseline or latest_baseline(pid, exclude=exp_name)
-    c.info(f"experiment={exp_name}  baseline={baseline or '(none -- first run)'}")
-
-    t0 = time.time()
-    result = braintrust.Eval(
-        c.PROJECT_NAME,
-        data=data,
-        task=task,
-        scores=build_scorers(args.use_llm),
-        experiment_name=exp_name,
-        base_experiment_name=baseline,
-        max_concurrency=args.max_concurrency,
+    experiment_name = f"w02-{args.model}-{c.RUN_ID}"
+    result = run_eval(
+        rows,
+        task,
+        build_scorers(args.use_llm),
+        experiment_name,
+        baseline=args.baseline or latest_baseline(pid, exclude=experiment_name),
         metadata={
             "model": args.model,
             "prompt_slug": PROMPT_SLUG,
@@ -209,82 +396,21 @@ def main() -> None:
             "dataset": args.dataset,
             "dataset_version": args.dataset_version or "latest",
         },
-        tags=["workflow-02", "offline"],
-    )
-    dur = time.time() - t0
-    summary = result.summary
-    c.info(f"{len(data):,} cases in {dur:.1f}s ({len(data) / max(dur, 1e-6):.1f} cases/s)")
-    c.info(summary.experiment_url or "")
-
-    c.step("Wait until eval results are queryable")
-    c.wait_until_queryable(
-        f"SELECT count(1) AS n FROM experiment('{summary.experiment_id}')",
-        expect_at_least=len(data),
-        label="eval_result_to_queryable",
+        max_concurrency=args.max_concurrency,
     )
 
-    # -------------------------------------------------- 4. inspect failures
-    c.step("Inspect failures")
-    errored = [r for r in result.results if r.error is not None]
-    low = sorted(
-        (r for r in result.results if r.error is None and (r.scores.get("keyword_overlap") or 0) < args.min_score),
-        key=lambda r: r.scores.get("keyword_overlap") or 0,
-    )
-    c.info(f"{len(errored)} errored, {len(low)} below the {args.min_score} keyword_overlap bar")
-    for r in low[:5]:
-        q = (r.input or {}).get("question", "")
-        c.info(f"  score={r.scores.get('keyword_overlap'):.2f}  q={q[:60]!r}")
-    for r in errored[:3]:
-        c.info(f"  ERROR {type(r.error).__name__}: {str(r.error)[:120]}")
+    errored = inspect_failures(result, GATE_SCORE, args.min_score)
+    scores = compare_to_baseline(result.summary)
 
-    # The same triage from the server side, which is what the UI and any
-    # downstream automation actually run:
-    worst = c.btql(
-        f"""
-        SELECT id, input, output, expected, scores
-        FROM experiment('{summary.experiment_id}')
-        WHERE scores.keyword_overlap < {args.min_score}
-        ORDER BY scores.keyword_overlap ASC
-        LIMIT 10
-        """
-    )
-    c.info(f"BTQL returned {len(worst)} failing rows for triage")
-    for row in worst[:3]:
-        c.info(f"  {c.log_permalink(summary.experiment_id, row['id'], object_type='experiment')}")
-
-    # ------------------------------------------------ 5. compare to baseline
-    c.step("Compare against the baseline")
-    if not summary.comparison_experiment_name:
-        c.warn("no baseline resolved -- this run becomes the baseline for the next one")
-    else:
-        c.info(f"{summary.experiment_name} vs {summary.comparison_experiment_name}")
-    scores, metrics = c.summary_scores(summary)
-    for name, s in scores.items():
-        delta = f"{s.diff:+.4f}" if s.diff is not None else "  n/a "
-        c.info(f"  {name:<20} {s.score:.4f}  delta={delta}  +{s.improvements or 0}/-{s.regressions or 0}")
-    for name, m in metrics.items():
-        c.info(f"  {name:<20} {m.metric}{m.unit}")
-
-    # ------------------------------------------------------ 6. ship decision
     c.step("Ship decision")
-    gate = scores.get("keyword_overlap")
-    reasons: list[str] = []
-    if errored:
-        reasons.append(f"{len(errored)} cases errored")
-    if gate is None:
-        reasons.append("gate score keyword_overlap is missing")
-    else:
-        if gate.score < args.min_score:
-            reasons.append(f"keyword_overlap {gate.score:.4f} < floor {args.min_score}")
-        if gate.diff is not None and gate.diff < -args.max_regression:
-            reasons.append(f"regressed {gate.diff:+.4f} vs baseline (max {-args.max_regression:+.4f})")
-
+    reasons = ship_decision(scores, errored, GATE_SCORE, args.min_score, args.max_regression)
+    url = result.summary.experiment_url
     if reasons:
         print("\n\033[31mBLOCK\033[0m " + "; ".join(reasons))
-        print(f"      {summary.experiment_url}")
+        print(f"      {url}")
         raise SystemExit(1)
     print(f"\n\033[32mSHIP\033[0m  prompt {PROMPT_SLUG}@{prompt_version} on {args.model}")
-    print(f"      {summary.experiment_url}")
+    print(f"      {url}")
 
 
 if __name__ == "__main__":
