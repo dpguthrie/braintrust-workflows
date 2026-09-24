@@ -10,6 +10,8 @@ The public [`project_score` API](https://www.braintrust.dev/docs/api-reference/p
 
 [`rewind.py`](rewind.py) calls `POST /brainstore/automation/reset-cursors`, the data plane route used by the UI. It accepts a rule ID, `project_logs:<project-id>`, and a transaction ID derived from the UTC start time. This route is not in the public OpenAPI reference, so verify it on your deployment before relying on it as a long-lived integration. It requires a data plane version that supports online scoring rewind (v2.3.0 or later).
 
+The conversion in the script is specific to Braintrust's transaction cursor format: a fixed prefix, Unix time in seconds, and a 16-bit sequence number. The script subtracts one from the first cursor at the requested second so that second is included. If you use MCP instead, `update_online_scoring_rule(operation="rewind")` accepts `start_time` directly and performs this conversion for you.
+
 ```bash
 pip install -r requirements.txt
 export BRAINTRUST_API_KEY='...'
