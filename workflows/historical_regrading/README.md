@@ -23,10 +23,10 @@ Match the scope and row placement to where the input and score actually live. Ch
 
 ## After the rewind
 
-Wait for scoring to finish, then query the bounded window for the expected score and count missing scores. Pause the temporary rule when done. Build a **separately named** review dataset from that historical interval using the script in [automated review](../automated_review/README.md) with `--start`, `--end`, and `--dataset-name`. Set its `SCORE_NAME` to the newly adopted score key.
+Wait for scoring to finish, then query the bounded window for the expected score and count missing scores. Pause the temporary rule when done. To build a **separately named** review dataset from that historical interval, edit the SQL and dataset name in [automated review](../automated_review/README.md). Use the newly adopted score key in that SQL.
 
 The MCP rule accepts saved evaluator IDs, not a version pin in `function_ids`. Keep that evaluator definition stable while the rewind runs, or use an immutable copy for the promotion. Record the evaluator ID and version in your run notes. This matters if an evaluator is edited during a long backfill.
 
 ## Filter placement
 
-Use the same Boolean expression in the scoring rule's `btql_filter` and the review script's `BTQL_FILTER`. The rule also includes the historical time bounds. A filter in the review query cannot undo grading work already performed on unrelated traces.
+Use the same source predicate in the scoring rule's `btql_filter` and the automated review SQL. The rule also includes the historical time bounds. A filter in the review query cannot undo grading work already performed on unrelated traces.

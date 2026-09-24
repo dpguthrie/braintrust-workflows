@@ -7,7 +7,7 @@ Small, adaptable examples for work around Braintrust traces, scoring, and datase
 | [Automated review](workflows/automated_review/README.md) | Select matching production rows and place new cases in a daily dataset for human review | Minimal Python script or Codex + Braintrust MCP |
 | [Historical regrading](workflows/historical_regrading/README.md) | Reprocess a bounded historical window after adopting a new evaluator | Codex + Braintrust MCP online scoring rule rewind |
 
-Start with **automated review**. It is the daily job. Its exact source filter lives in the query; its disagreement rule lives in a short Python function or the Codex task instructions. **Historical regrading** is an occasional promotion step and can feed a separate review dataset.
+Start with **automated review**. It is the daily job. One SQL statement defines both the source filter and the disagreement condition. **Historical regrading** is an occasional promotion step and can feed a separate review dataset.
 
 These are templates. Set the project ID, field paths, scorer name, and allowed source values for your own organization before running anything. Do not put API keys or private trace data in this repository.
 
