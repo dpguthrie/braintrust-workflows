@@ -5,11 +5,11 @@ Schedule a Codex task with Braintrust MCP connected. Give it the edited SQL from
 ```text
 Run the review selection expressed by the SQL in workflows/automated_review/run.py for the previous 24 hours. Use Braintrust MCP's sql_query tool: put the query's SELECT fields in select, project_logs and its project ID in object_type/object_ids, and the query's WHERE condition in where. The tool does not accept a whole SQL string.
 
-Treat the SQL as the complete definition of which rows to review. Do not invent additional filters or decision rules. If the result reaches the query limit, report that it is incomplete and stop before writing.
+Treat the SQL as the complete definition of which rows to review. Do not invent additional filters or decision rules. The MCP sql_query tool does not accept a cursor for paging. If the result reaches the query limit, run workflows/automated_review/run.py instead; it follows the SQL cursor until all pages are read.
 
-Create or resolve today's review dataset, then use edit_dataset_rows to insert the matching source input and metadata containing the source row ID, root span ID, observed output, and grader score. Leave expected unset for human labeling. Before inserting, query the destination dataset for existing source row IDs and skip those rows so a rerun does not duplicate or overwrite labels. MCP inserts generate new row IDs; do not assume the source row ID becomes the dataset row ID.
+Create or resolve today's review dataset. Before inserting, query the destination dataset for existing row IDs and skip those rows so a rerun does not overwrite labels. For each new row, use POST /v1/dataset/{dataset_id}/insert with an events array. Set the dataset row id to the source row id; copy input; leave expected unset. Set top-level origin to {object_type: "project_logs", object_id: source project_id, id: source row id, _xact_id: source _xact_id}. Set metadata.observed_output and metadata.grader_score from the query, and metadata.scorer_function_id and metadata.scorer_version to the exact saved scorer/version that produced the selected scores. Use batches of at most 100 events. The MCP edit_dataset_rows tool does not expose top-level origin, so use the dataset API for this insert.
 
 Report the dataset link and the counts queried, inserted, and already present. Do not modify a golden dataset.
 ```
 
-Adapt the SQL and dataset name for your project before scheduling. `edit_dataset_rows` accepts at most 100 changes per call; batch smaller result sets if needed.
+Adapt the SQL, dataset name, and scorer ID/version for your project before scheduling. Include `project_id` and `_xact_id` in the MCP query results. Run this task after any historical regrade has finished.
