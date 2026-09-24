@@ -8,11 +8,11 @@ The dataset is named `review-YYYY-MM-DD` for the UTC day being processed. Each r
 
 Open [`run.py`](run.py) and edit the small **CUSTOMIZE** block:
 
-1. Set two or more exact `SOURCE_TOPICS`. The script applies them in SQL and checks them again in Python.
+1. Replace `BTQL_FILTER` with the exact Boolean expression you want in the SQL `WHERE` clause. The example combines `is_root = true` with two exact `input.source_topic` values. Keep the daily time bounds supplied by the script.
 2. Set `SCORE_NAME` to the **score key shown on the log row** (often the evaluator's display name).
 3. Set `HUMAN_ACTION_PATH` and the recognized positive/negative values.
 4. Edit `is_review_candidate()` if your definition of a disagreement differs. Keep it a pure function over one row.
-5. If the scored row is a child span, change `ROW_FILTER` from `is_root = true` to a stable condition for that span.
+5. If the scored row is a child span, change the `is_root = true` portion of `BTQL_FILTER` to a stable condition for that span.
 
 The time window is one complete UTC day. Schedule it after online scoring has settled. Run the same day again to catch late scores; the script checks existing dataset source IDs before inserting, so an ordinary rerun does not erase reviewer labels. Run only one copy of the job for a given day at a time.
 
@@ -36,12 +36,12 @@ The script stops if the query reaches `MAX_ROWS`; narrow the window or raise the
 
 ## Codex scheduled task, using Braintrust MCP
 
-Use [`CODEX.md`](CODEX.md) as a template for a daily Codex task. Fill the private task configuration with your actual project ID, topics, score name, field paths, and decision mapping. The MCP path uses `sql_query` and `edit_dataset_rows`; it needs no Python runtime or API key in the task prompt. It queries the destination dataset before inserting because the MCP insert operation generates row IDs.
+Use [`CODEX.md`](CODEX.md) as a template for a daily Codex task. Fill the private task configuration with your actual project ID, one BTQL filter expression, score name, field paths, and decision mapping. The MCP path uses `sql_query` and `edit_dataset_rows`; it needs no Python runtime or API key in the task prompt. It queries the destination dataset before inserting because the MCP insert operation generates row IDs.
 
 For interactive inspection, the Braintrust CLI can run the same SQL:
 
 ```bash
-bt sql --non-interactive "SELECT id, input.source_topic, scores FROM project_logs('<project-id>') WHERE created > now() - interval 1 day AND input.source_topic IN ('<topic-a>', '<topic-b>') LIMIT 20"
+bt sql --non-interactive "SELECT id, input.source_topic, scores FROM project_logs('<project-id>') WHERE created > now() - interval 1 day AND (is_root = true AND input.source_topic IN ('topic/example_a', 'topic/example_b')) LIMIT 20"
 ```
 
 ## Adapting the cadence

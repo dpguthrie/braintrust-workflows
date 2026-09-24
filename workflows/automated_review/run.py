@@ -9,10 +9,9 @@ import braintrust
 import requests
 
 
-# CUSTOMIZE: match the row that carries both the score and human decision.
+# CUSTOMIZE: paste the exact Braintrust filter expression here.
 PROJECT_ID = os.environ.get("BT_PROJECT_ID", "")
-SOURCE_TOPICS = ("topic/example_a", "topic/example_b")
-ROW_FILTER = "is_root = true"
+BTQL_FILTER = "is_root = true AND input.source_topic IN ('topic/example_a', 'topic/example_b')"
 SCORE_NAME = "Decision quality"
 HUMAN_ACTION_PATH = ("output", "human_action")
 HUMAN_POSITIVE = {"handoff"}
@@ -54,13 +53,11 @@ def sql_quote(value):
 def source_rows(start_day, end_day):
     start = datetime.combine(start_day, time.min, timezone.utc)
     end = datetime.combine(end_day, time.min, timezone.utc)
-    topics = ", ".join(sql_quote(topic) for topic in SOURCE_TOPICS)
     query = f"""SELECT id, root_span_id, created, input, output, scores
 FROM project_logs({sql_quote(PROJECT_ID)})
 WHERE created >= {sql_quote(start.isoformat().replace('+00:00', 'Z'))}
   AND created < {sql_quote(end.isoformat().replace('+00:00', 'Z'))}
-  AND input.source_topic IN ({topics})
-  AND ({ROW_FILTER})
+  AND ({BTQL_FILTER})
 ORDER BY _pagination_key
 LIMIT 100"""
     url = os.environ.get("BRAINTRUST_API_URL", "https://api.braintrust.dev").rstrip("/")
@@ -82,8 +79,7 @@ LIMIT 100"""
         if cursor in seen_cursors:
             raise RuntimeError("BTQL repeated a pagination cursor")
         seen_cursors.add(cursor)
-    # Check exact values again before writes, even if the SQL filter changes.
-    return [row for row in rows if field(row, ("input", "source_topic")) in SOURCE_TOPICS]
+    return rows
 
 
 def main():

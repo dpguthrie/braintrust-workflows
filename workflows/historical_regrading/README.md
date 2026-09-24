@@ -29,4 +29,4 @@ The MCP rule accepts saved evaluator IDs, not a version pin in `function_ids`. K
 
 ## Filter placement
 
-Apply the exact topic predicate in both places: the scoring rule's `btql_filter` for the backfill, and the review query for curation. That protects the workflow if one of the two configurations changes. A filter in the review query cannot undo grading work already performed on unrelated traces.
+Use the same Boolean expression in the scoring rule's `btql_filter` and the review script's `BTQL_FILTER`. The rule also includes the historical time bounds. A filter in the review query cannot undo grading work already performed on unrelated traces.
